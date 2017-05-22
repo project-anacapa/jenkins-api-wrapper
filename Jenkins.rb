@@ -1,65 +1,164 @@
 require 'jenkins_api_client'
 require 'yaml'
 require 'rest-client'
-
-credentials =
-
+require 'json'
+require 'net/http'
+require 'uri'
 
 module Jenkins
-  Client = JenkinsApi::Client.new(YAML.load_file(File.expand_path('./jenkins.yml')).merge({:log_level => 4}))
+  Credentials = YAML.load_file(File.expand_path('./jenkins.yml'))
+  Client = JenkinsApi::Client.new(Credentials.merge({:log_level => 4}))
 
-  JOB_SETUP_ASSIGNMENT = 'AnacapaGrader-setupAssignment'
+  class Build
+    attr_reader :job
+    attr_reader :buildNo
 
-  class Lab
-    attr_reader :git_provider_domain
-    attr_reader :course_org
-    attr_reader :credentials_id
-    attr_reader :assignment_job_name
-    attr_reader :grader_job_name
-
-    def initialize(git_provider_domain:, course_org:, credentials_id:, lab_name:)
-      @git_provider_domain = git_provider_domain
-      @course_org = course_org
-      @credentials_id = credentials_id
-      @lab_name = lab_name
-
-      @assignment_job_name = "AnacapaGrader #{@git_provider_domain} #{@course_org} assignment-#{@lab_name}"
-      @grader_job_name = "AnacapaGrader #{@git_provider_domain} #{@course_org} grader-#{@lab_name}"
+    def initialize(job, buildNo)
+      @job = job
+      @buildNo = buildNo
+      @details = nil
     end
 
-    def jobsExist?
-      return Client.job.exists?(@assignment_job_name) && Client.job.exists?(@grader_job_name)
+    def status
+      return Client.job.get_current_build_status(@assignment_job_name)
     end
 
-    def makeGraderAndAssignentIfNotExist()
-      if !jobsExist?
-        puts "jobsExist? failed to locate the grader and assignment jobs. Creating them now..."
-        begin
-          Client.job.delete(@assignment_job_name)
-        rescue
-        end
-        begin
-          Client.job.delete(@grader_job_name)
-        rescue
-        end
+    def details(force: true)
+      if @details == nil || force then
+        @details = Client.job.get_build_details(@job.jobName, @buildNo)
+      end
+      return @details
+    end
 
-        build_number = Client.job.build(JOB_SETUP_ASSIGNMENT, {
-          "git_provider_domain" => @git_provider_domain,
-          "course_org" => @course_org,
-          "credentials_id" => @credentials_id,
-          "lab_name" => @lab_name
-        }, {
-          "build_start_timeout" => 60,
-          "poll_interval" => 2
+    def artifacts()
+      return self.details["artifacts"]
+    end
+
+    def downloadArtifact(artifact, baseUrl: nil) # NOTE: this input is the artifact object from artifacts
+      if baseUrl.nil? then
+        baseUrl = self.details(:force => false)["url"]
+      end
+
+      uri = URI.parse("#{baseUrl}/artifact/#{artifact["relativePath"]}")
+      http = Net::HTTP.new(uri.host, uri.port)
+      request = Net::HTTP::Get.new(uri.request_uri)
+      request.basic_auth(Credentials["username"], Credentials["password"])
+      response = http.request(request)
+
+      return response.body
+    end
+  end
+
+  class Job
+    attr_reader :jobName
+    def initialize(jobName)
+      @jobName = jobName
+    end
+
+    def rebuild(env=nil) # NOTE: this can throw connection exceptions etc.
+      buildNo = Client.job.build(@jobName, env || {}, {
+          "build_start_timeout" => 30,
+          "poll_interval" => 1
         })
+      return getBuild(buildNo)
+    end
 
-        buildDetails = Client.job.get_build_details(JOB_SETUP_ASSIGNMENT, build_number)
+    def currentBuild
+      result = Client.job.get_current_build_number(@jobName)
+      if result > 0 then
+        return getBuild(result)
+      else
+        return nil
+      end
+    end
 
-        if buildDetails["result"] != "SUCCESS"
-          raise "failed to create grader and or assignment jobs. Status: #{buildDetails['result']}"
+    def getBuild(buildNo)
+      return Build.new(self, buildNo)
+    end
+
+    def exists?
+      return Client.job.exists?(@jobName)
+    end
+
+    def destroy!
+      return Client.job.delete(@jobName)
+    end
+  end
+
+  JobSetupAssignment = Job.new('AnacapaGrader-setupAssignment')
+
+  class Assignment
+    attr_reader :gitProviderDomain
+    attr_reader :courseOrg
+    attr_reader :credentials_id
+    attr_reader :credentialsId
+    attr_reader :labName
+
+    attr_reader :jobGrader
+    attr_reader :jobInstructor
+
+    def initialize(gitProviderDomain:, courseOrg:, credentialsId:, labName:)
+      @gitProviderDomain = gitProviderDomain
+      @courseOrg = courseOrg
+      @credentialsId = credentialsId
+      @labName = labName
+
+      @jobInstructor = Job.new("AnacapaGrader #{@gitProviderDomain} #{@courseOrg} assignment-#{@labName}")
+      @jobGrader = Job.new("AnacapaGrader #{@gitProviderDomain} #{@courseOrg} grader-#{@labName}")
+    end
+
+    def checkJenkinsState
+      # checks that the projects exist on jenkins
+      if !@jobInstructor.exists? || !@jobGrader.exists? then
+        # trigger a rebuild of both the instructor and grader jobs...
+        begin
+          @jobInstructor.destroy!
+        rescue
+
         end
-        puts "Done."
+        begin
+          @jobGrader.destroy!
+        rescue
+        end
+
+        setupBuild = JobSetupAssignment.rebuild({
+            "git_provider_domain" => @gitProviderDomain,
+            "course_org" => @courseOrg,
+            "credentials_id" => @credentialsId,
+            "lab_name" => @labName
+          })
+
+        details = nil
+        loop do
+          details = setupBuild.details()
+          break if !details.key?("building") || !details["building"]
+          sleep(1)
+        end
+
+        raise "An error was encountered while running the grader jobs. Status: #{details["result"]}" unless details["result"] == "SUCCESS"
+        raise "Failed to create the expected jobs." unless !@jobInstructor.exists? || !@jobGrader.exists?
+
       end
     end
   end
+
+end
+
+assignment = Jenkins::Assignment.new(
+  gitProviderDomain: "github.com",
+  courseOrg: "ucsb-cs-test-org-1", # test
+  credentialsId: "github.com-gareth-machine-user",
+  labName: "lab00"
+)
+
+assignment.checkJenkinsState
+
+currentBuild = assignment.jobInstructor.currentBuild
+if currentBuild.nil? then
+  assignment.jobInstructor.rebuild
+  currentBuild = assignment.jobInstructor.currentBuild
+end
+
+for artifact in currentBuild.artifacts
+  puts(currentBuild.downloadArtifact(artifact))
 end
